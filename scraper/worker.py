@@ -9,6 +9,18 @@ from database.quote_repository import save_quotes
 from scraper.request_handler import request_to_scrape
 from scraper.quote_parser import parse_quotes
 from scraper.url_queue import get_pending_url, add_url
+from requests.exceptions import RequestException
+
+
+MAX_FAILED_ATTEMPTS = 3
+
+RETRYABLE_HTTP_STATUSES = {
+    429,  # Too Many Requests
+    500,  # Internal Server Error
+    502,  # Bad Gateway
+    503,  # Service Unavailable
+    504,  # Gateway Timeout
+}
 
 
 def update_url_status(url_id, status, http_status=None, failed=False):
@@ -47,32 +59,18 @@ def find_next_page(html, current_url):
     return urljoin(current_url, href)
 
 
+
 def process_one_url():
     url_record = get_pending_url()
 
     if not url_record:
         print("No pending URLs found.")
-        return
+        return None
 
     url_id = url_record["id"]
     url = url_record["url"]
+    previous_retry_count = url_record["retry_count"]
     http_status = None
-
-    engine = db_engine()
-
-    # Mark the URL as currently being processed.
-    with engine.begin() as connection:
-        connection.execute(
-            text("""
-                UPDATE scrape_url
-                SET status = 'PROCESSING',
-                    last_attempt_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = :url_id
-                  AND status = 'PENDING'
-            """),
-            {"url_id": url_id},
-        )
 
     try:
         print(f"Processing URL: {url}")
@@ -89,13 +87,10 @@ def process_one_url():
                 f"Unexpected HTTP status: {http_status}"
             )
 
-        # Extract quotes from the page.
         quotes = parse_quotes(response.text)
 
-        # Save quotes before marking the URL successful.
         inserted_count = save_quotes(quotes, url)
 
-        # Discover and queue the next page, if one exists.
         next_url = find_next_page(response.text, url)
 
         if next_url:
@@ -104,7 +99,6 @@ def process_one_url():
         else:
             print("No next page found.")
 
-        # Mark success only after processing is complete.
         update_url_status(
             url_id,
             status="SUCCESS",
@@ -115,16 +109,49 @@ def process_one_url():
         print(f"New quotes inserted: {inserted_count}")
         print(f"Successfully processed: {url}")
 
+        return {
+            "url": url,
+            "status": "SUCCESS",
+            "quotes_parsed": len(quotes),
+            "quotes_inserted": inserted_count,
+            "next_url": next_url,
+        }
+
     except Exception as exc:
+        # Decide whether this failure is worth retrying.
+        retryable = (
+            http_status in RETRYABLE_HTTP_STATUSES
+            or isinstance(exc, RequestException)
+        )
+
+        # Count this failed worker attempt.
+        failed_attempts = previous_retry_count + 1
+
+        if retryable and failed_attempts < MAX_FAILED_ATTEMPTS:
+            next_status = "PENDING"
+        else:
+            next_status = "FAILED"
+
         update_url_status(
             url_id,
-            status="FAILED",
+            status=next_status,
             http_status=http_status,
             failed=True,
         )
 
-        print(f"Failed to process {url}: {exc}")
+        print(
+            f"Failed to process {url}: {exc}. "
+            f"Failed attempts: {failed_attempts}/"
+            f"{MAX_FAILED_ATTEMPTS}. "
+            f"Next status: {next_status}"
+        )
 
+        return {
+            "url": url,
+            "status": next_status,
+            "quotes_parsed": 0,
+            "quotes_inserted": 0,
+            "next_url": None,
+            "error": str(exc),
+        }
 
-if __name__ == "__main__":
-    process_one_url()

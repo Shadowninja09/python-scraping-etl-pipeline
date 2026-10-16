@@ -46,14 +46,30 @@ def get_pending_url():
         FROM scrape_url
         WHERE status = 'PENDING'
         ORDER BY id
+        FOR UPDATE SKIP LOCKED
         LIMIT 1
     """)
 
     engine = db_engine()
 
-    with engine.connect() as connection:
+    with engine.begin() as connection:
         row = connection.execute(query).mappings().first()
-        return dict(row) if row else None
+
+        if not row:
+            return None
+
+        connection.execute(
+            text("""
+                UPDATE scrape_url
+                SET status = 'PROCESSING',
+                    last_attempt_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :url_id
+            """),
+            {"url_id": row["id"]},
+        )
+
+        return dict(row)
 
 
 def seed_starting_url():
